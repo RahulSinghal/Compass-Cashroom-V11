@@ -252,7 +252,10 @@ def save_report(
     db: Session = Depends(get_db),
 ):
     """Save a completed reasonableness report."""
-    status = ReasonablenessStatus(body.status)
+    try:
+        status = ReasonablenessStatus(body.status)
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"Invalid status: {body.status}. Must be 'Reasonable' or 'Overfunded'.")
 
     report = ReasonablenessReport(
         id=str(uuid.uuid4()),

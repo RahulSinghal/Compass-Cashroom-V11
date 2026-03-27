@@ -1368,3 +1368,575 @@ class TestAdminIntegration:
             headers={"Authorization": f"Bearer {operator_token}"},
         )
         assert r.status_code == 403
+
+
+# ===========================================================================
+# PHASE 6 — Controller Workflow Tests (TC-RT-6.x)
+# ===========================================================================
+# These tests cover the full controller workflow: multi-location generation,
+# submission filtering (only approved), save validation edge cases,
+# location group authorization, and data integrity.
+
+
+class TestControllerMultiLocationGeneration:
+    """
+    TC-RT-6.1: Generate for multiple locations returns independent calculations
+    ---------------------------------------------------------------------------
+    Purpose:  Verify that when a controller generates for a cost center group
+              with multiple locations (e.g., loc-1 + loc-2 under 5082), the
+              response contains separate calculation entries per location,
+              each with independently computed max values.
+    Setup:    seed_rt_submissions has 5 submissions each for loc-1 and loc-2.
+              loc-1: F=[800,600,900,750,700], H=[2502,2000,2200,2300,2100]
+              loc-2: F=[400,500,450,380,420], H=[1800,2000,1900,1700,1850]
+    Action:   POST /generate with location_ids=["loc-1","loc-2"].
+    Expect:   2 calculation entries.
+              loc-1: max_f=900, max_h=2502.
+              loc-2: max_f=500, max_h=2000.
+              Totals computed independently (not summed across locations).
+    """
+
+    def test_generate_multiple_locations(self, client, controller_token, seed_rt_submissions):
+        r = client.post(
+            "/v1/reasonableness/generate",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "location_ids": ["loc-1", "loc-2"],
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+            },
+        )
+        assert r.status_code == 200
+        calcs = r.json()["calculations"]
+        assert len(calcs) == 2, "Should have 2 separate calculation entries"
+
+        # Find each location's calculations
+        c1 = next(c for c in calcs if c["loc_id"] == "loc-1")
+        c2 = next(c for c in calcs if c["loc_id"] == "loc-2")
+
+        # loc-1: max_f=900, max_h=2502, max_j=200
+        assert c1["max_f"] == 900.0
+        assert c1["max_h"] == 2502.0
+        assert c1["max_j"] == 200.0
+        assert c1["total"] == 900.0 + 2502.0 + 200.0  # 3602
+
+        # loc-2: max_f=500, max_h=2000, max_j=300
+        assert c2["max_f"] == 500.0
+        assert c2["max_h"] == 2000.0
+        assert c2["max_j"] == 300.0
+        assert c2["total"] == 500.0 + 2000.0 + 300.0  # 2800
+
+        # Verify totals are independent (not summed)
+        assert c1["total"] != c2["total"]
+
+    """
+    TC-RT-6.2: Generate with mixed data — one location has data, another doesn't
+    -----------------------------------------------------------------------------
+    Purpose:  Verify that when generating for multiple locations where one has
+              submissions and another has none, both appear in the response.
+              The location with no data should have all zeros.
+    Setup:    loc-1 has 5 submissions, loc-3 has 0 submissions in Jan 2026.
+    Action:   POST /generate with location_ids=["loc-1","loc-3"].
+    Expect:   2 entries. loc-1 has real data, loc-3 has all zeros.
+    """
+
+    def test_generate_mixed_data_locations(self, client, controller_token, seed_rt_submissions):
+        r = client.post(
+            "/v1/reasonableness/generate",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "location_ids": ["loc-1", "loc-3"],
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.25,
+            },
+        )
+        assert r.status_code == 200
+        calcs = r.json()["calculations"]
+        assert len(calcs) == 2
+
+        c1 = next(c for c in calcs if c["loc_id"] == "loc-1")
+        c3 = next(c for c in calcs if c["loc_id"] == "loc-3")
+
+        # loc-1 has real data
+        assert c1["max_f"] > 0
+        assert c1["actual_fund"] > 0
+        assert c1["count"] == 5
+
+        # loc-3 has no submissions → all zeros
+        assert c3["max_f"] == 0.0
+        assert c3["max_h"] == 0.0
+        assert c3["total"] == 0.0
+        assert c3["actual_fund"] == 0.0
+        assert c3["count"] == 0
+        assert c3["section_a_data"] == []
+
+    """
+    TC-RT-6.3: Section A daily data extracted correctly
+    -----------------------------------------------------
+    Purpose:  Verify that Section A (loose currency) daily values are extracted
+              from submissions and returned with correct dates, average, and count.
+    Setup:    loc-1 has 5 submissions with Section A totals: 500, 450, 600, 520, 480.
+    Action:   POST /generate for loc-1.
+    Expect:   section_a_data has 5 entries with correct date/sA pairs.
+              avg_sa = (500+450+600+520+480)/5 = 510.
+              count = 5.
+    """
+
+    def test_generate_section_a_data(self, client, controller_token, seed_rt_submissions):
+        r = client.post(
+            "/v1/reasonableness/generate",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "location_ids": ["loc-1"],
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+            },
+        )
+        assert r.status_code == 200
+        calc = r.json()["calculations"][0]
+
+        assert calc["count"] == 5
+        assert len(calc["section_a_data"]) == 5
+
+        # Verify dates are present
+        dates = [entry["date"] for entry in calc["section_a_data"]]
+        assert "2026-01-15" in dates
+        assert "2026-01-17" in dates
+
+        # Verify average: (500+450+600+520+480)/5 = 510
+        assert calc["avg_sa"] == pytest.approx(510.0)
+
+
+class TestControllerSubmissionFiltering:
+    """
+    TC-RT-6.4: Generate uses only approved submissions
+    ----------------------------------------------------
+    Purpose:  Verify that the generate endpoint only pulls data from approved
+              submissions. Rejected/pending submissions must NOT affect the
+              max value calculations, even if they have higher values.
+    Setup:    1. seed_rt_submissions creates 5 approved subs for loc-1 (max F=900).
+              2. Create 1 additional REJECTED submission with F=5000.
+    Action:   POST /generate for loc-1.
+    Expect:   max_f = 900 (from approved only), NOT 5000 (from rejected).
+    """
+
+    def test_generate_uses_only_approved(self, client, controller_token, seed_rt_submissions):
+        import uuid as _uuid
+        from tests.conftest import TestingSessionLocal
+        from app.models.submission import Submission, SubmissionStatus, SubmissionSource
+        from app.models.user import User
+        from datetime import datetime, timezone
+
+        # Create a REJECTED submission with very high F value
+        db = TestingSessionLocal()
+        try:
+            operator = db.query(User).filter(User.email == "operator@compass.com").first()
+            db.add(Submission(
+                id=str(_uuid.uuid4()),
+                location_id="loc-1",
+                location_name="The Grange Hotel",
+                operator_id=operator.id,
+                operator_name=operator.name,
+                submission_date="2026-01-18",
+                status=SubmissionStatus.REJECTED,
+                source=SubmissionSource.FORM,
+                sections={"A": {"total": 9999}, "F": {"total": 5000}, "H": {"total": 9000}, "J": {"total": 3000}},
+                total_cash=50000,
+                expected_cash=9800.0,
+                variance=0.0,
+                variance_pct=0.0,
+                submitted_at=datetime.now(timezone.utc),
+            ))
+            db.commit()
+        finally:
+            db.close()
+
+        # Generate — should ignore the rejected submission
+        r = client.post(
+            "/v1/reasonableness/generate",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "location_ids": ["loc-1"],
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+            },
+        )
+        assert r.status_code == 200
+        calc = r.json()["calculations"][0]
+
+        # max_f should be 900 (from approved), NOT 5000 (from rejected)
+        assert calc["max_f"] == 900.0, f"Expected 900 from approved subs, got {calc['max_f']}"
+        assert calc["max_h"] == 2502.0, "Should use approved submissions only"
+        assert calc["actual_fund"] == 10200.0, "actual_fund from approved only"
+
+    """
+    TC-RT-6.5: Single-day date range is valid
+    -------------------------------------------
+    Purpose:  Verify that from_date == to_date is accepted as a valid range
+              (testing a single day's submissions).
+    Setup:    seed_rt_submissions has a submission on 2026-01-15 for loc-1.
+    Action:   POST /generate with from_date=to_date="2026-01-15".
+    Expect:   200 OK. Returns data for just that one day.
+              count=1, section_a_data has 1 entry.
+    """
+
+    def test_generate_single_day_range(self, client, controller_token, seed_rt_submissions):
+        r = client.post(
+            "/v1/reasonableness/generate",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "location_ids": ["loc-1"],
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-15",
+                "factor": 1.25,
+            },
+        )
+        assert r.status_code == 200
+        calc = r.json()["calculations"][0]
+        assert calc["count"] == 1, "Single day should return 1 submission"
+        assert len(calc["section_a_data"]) == 1
+        assert calc["section_a_data"][0]["date"] == "2026-01-15"
+
+
+class TestControllerSaveValidation:
+    """
+    TC-RT-6.6: Save report with Overfunded status
+    ------------------------------------------------
+    Purpose:  Verify that a report with Overfunded status is saved and
+              persisted correctly, including the status badge.
+    Setup:    Controller saves a report with status="Overfunded" and
+              a location report where net > 0.
+    Action:   POST /reports, then GET /reports/{id}.
+    Expect:   Both save response and detail response show status="Overfunded".
+    """
+
+    def test_save_overfunded_report(self, client, controller_token):
+        r = client.post(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "group_key": "5082",
+                "cost_center": "5082",
+                "location_labels": "Overfunded Save Test",
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+                "preparer": "Chris Controller",
+                "status": "Overfunded",
+                "location_reports": [SAMPLE_LOC_REPORT_OVERFUNDED],
+            },
+        )
+        assert r.status_code == 201
+        assert r.json()["status"] == "Overfunded"
+
+        # Verify persisted
+        detail = client.get(
+            f"/v1/reasonableness/reports/{r.json()['id']}",
+            headers={"Authorization": f"Bearer {controller_token}"},
+        )
+        assert detail.json()["status"] == "Overfunded"
+
+    """
+    TC-RT-6.7: Save with 3 sub-location reports
+    -----------------------------------------------
+    Purpose:  Verify that saving a report with 3 location reports
+              (simulating a cost center group with 3 locations) correctly
+              stores and retrieves all 3 in the JSON column.
+    Setup:    Create 3 distinct RtLocReport entries with different loc_ids.
+    Action:   POST /reports, then GET /reports/{id}.
+    Expect:   location_reports array has exactly 3 entries, each with correct data.
+    """
+
+    def test_save_multiple_location_reports(self, client, controller_token):
+        lr3 = {
+            "loc_id": "loc-3", "loc_label": "Euston Station Bistro",
+            "total": 1500.0, "expected_fund": 1875.0, "actual_fund": 1600.0,
+            "over": -275.0, "cushion": -5000.0, "net": -5275.0,
+            "status": "Reasonable", "conclusion": "Within range.",
+            "required_actions": "no", "action_details": "",
+        }
+        r = client.post(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "group_key": "5082",
+                "cost_center": "5082",
+                "location_labels": "Three Loc Test",
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+                "preparer": "Chris Controller",
+                "status": "Overfunded",
+                "location_reports": [SAMPLE_LOC_REPORT, SAMPLE_LOC_REPORT_OVERFUNDED, lr3],
+            },
+        )
+        assert r.status_code == 201
+        report_id = r.json()["id"]
+
+        detail = client.get(
+            f"/v1/reasonableness/reports/{report_id}",
+            headers={"Authorization": f"Bearer {controller_token}"},
+        )
+        lrs = detail.json()["location_reports"]
+        assert len(lrs) == 3
+        assert lrs[0]["loc_id"] == "loc-1"
+        assert lrs[1]["loc_id"] == "loc-2"
+        assert lrs[2]["loc_id"] == "loc-3"
+        assert lrs[2]["total"] == 1500.0
+
+    """
+    TC-RT-6.8: Save with custom cushion value
+    --------------------------------------------
+    Purpose:  Verify that when a controller modifies the cushion from the
+              default (-5000) to a custom value, the custom value is persisted.
+    Setup:    Save a report where location_reports[0].cushion = -8000.
+    Action:   POST /reports, then GET detail.
+    Expect:   cushion = -8000 in the stored location report.
+    """
+
+    def test_save_custom_cushion(self, client, controller_token):
+        custom_lr = {**SAMPLE_LOC_REPORT, "cushion": -8000.0, "net": SAMPLE_LOC_REPORT["over"] + (-8000.0)}
+        r = client.post(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "group_key": "5082",
+                "cost_center": "5082",
+                "location_labels": "Custom Cushion Test",
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+                "preparer": "Chris Controller",
+                "status": "Reasonable",
+                "location_reports": [custom_lr],
+            },
+        )
+        assert r.status_code == 201
+
+        detail = client.get(
+            f"/v1/reasonableness/reports/{r.json()['id']}",
+            headers={"Authorization": f"Bearer {controller_token}"},
+        )
+        lr = detail.json()["location_reports"][0]
+        assert lr["cushion"] == -8000.0, "Custom cushion should be preserved"
+
+    """
+    TC-RT-6.9: Save with invalid status is rejected
+    --------------------------------------------------
+    Purpose:  Verify that the backend rejects reports with an invalid status
+              value (not "Reasonable" or "Overfunded").
+    Setup:    POST /reports with status="Invalid".
+    Action:   Expect a server error (500 or 422) since ReasonablenessStatus("Invalid")
+              raises ValueError.
+    Expect:   Non-2xx response.
+    """
+
+    def test_save_invalid_status_rejected(self, client, controller_token):
+        r = client.post(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "group_key": "5082",
+                "cost_center": "5082",
+                "location_labels": "Invalid Status Test",
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+                "preparer": "Chris Controller",
+                "status": "InvalidStatus",
+                "location_reports": [],
+            },
+        )
+        assert r.status_code >= 400, f"Expected error, got {r.status_code}"
+
+    """
+    TC-RT-6.10: Save with missing required field is rejected
+    -----------------------------------------------------------
+    Purpose:  Verify that Pydantic validation rejects payloads missing
+              required fields (e.g., omitting 'preparer').
+    Setup:    POST /reports without the 'preparer' field.
+    Action:   Expect 422 validation error.
+    Expect:   422 Unprocessable Entity with field error for 'preparer'.
+    """
+
+    def test_save_missing_required_field(self, client, controller_token):
+        r = client.post(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "group_key": "5082",
+                "cost_center": "5082",
+                "location_labels": "Missing Field Test",
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+                # "preparer" is intentionally omitted
+                "status": "Reasonable",
+                "location_reports": [],
+            },
+        )
+        assert r.status_code == 422
+
+
+class TestControllerLocationGroups:
+    """
+    TC-RT-6.11: Controller sees only their assigned locations
+    -----------------------------------------------------------
+    Purpose:  Verify that the location-groups endpoint filters results
+              to only include locations assigned to the controller.
+              Controller is assigned to [loc-1, loc-2, loc-3] which
+              covers cost centers 5082 and 5104. They should NOT see
+              loc-4 (5117) or loc-5 (5132).
+    Setup:    Seed locations have 5 locations across 4 cost centers.
+              Controller assigned to loc-1, loc-2, loc-3.
+    Action:   GET /location-groups with controller token.
+    Expect:   Only cost centers 5082 and 5104 returned.
+              Cost centers 5117 and 5132 are NOT in response.
+    """
+
+    def test_controller_sees_only_assigned(self, client, controller_token):
+        r = client.get(
+            "/v1/reasonableness/location-groups",
+            headers={"Authorization": f"Bearer {controller_token}"},
+        )
+        assert r.status_code == 200
+        groups = r.json()
+        cost_centers = [g["cost_center"] for g in groups]
+
+        # Should see 5082 (loc-1, loc-2) and 5104 (loc-3)
+        assert "5082" in cost_centers
+        assert "5104" in cost_centers
+
+        # Should NOT see 5117 (loc-4) or 5132 (loc-5)
+        assert "5117" not in cost_centers, "Controller should not see loc-4's cost center"
+        assert "5132" not in cost_centers, "Controller should not see loc-5's cost center"
+
+    """
+    TC-RT-6.12: Location group factor determination
+    --------------------------------------------------
+    Purpose:  Verify that the default_factor is correctly set based on
+              the number of sub-locations in a cost center group.
+              1 location → 1.25, 2+ locations → 1.50.
+    Setup:    5082 has loc-1 + loc-2 (2 locs), 5104 has loc-3 only (1 loc).
+    Action:   GET /location-groups with controller token.
+    Expect:   5082 group: default_factor=1.50, sub_locs has 2 entries.
+              5104 group: default_factor=1.25, sub_locs has 1 entry.
+    """
+
+    def test_factor_determination(self, client, controller_token):
+        r = client.get(
+            "/v1/reasonableness/location-groups",
+            headers={"Authorization": f"Bearer {controller_token}"},
+        )
+        groups = r.json()
+
+        grp_5082 = next(g for g in groups if g["cost_center"] == "5082")
+        assert grp_5082["default_factor"] == 1.50
+        assert len(grp_5082["sub_locs"]) == 2
+
+        grp_5104 = next(g for g in groups if g["cost_center"] == "5104")
+        assert grp_5104["default_factor"] == 1.25
+        assert len(grp_5104["sub_locs"]) == 1
+
+    """
+    TC-RT-6.13: Generate for nonexistent location returns 404
+    -----------------------------------------------------------
+    Purpose:  Verify that generating for a location ID that doesn't exist
+              in the database returns a 404 error, not a crash.
+    Setup:    POST /generate with location_ids=["loc-999"].
+    Action:   Expect 404.
+    Expect:   404 with detail message containing "loc-999".
+    """
+
+    def test_generate_nonexistent_location(self, client, controller_token):
+        r = client.post(
+            "/v1/reasonableness/generate",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "location_ids": ["loc-999"],
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+            },
+        )
+        assert r.status_code == 404
+        assert "loc-999" in r.json()["detail"]
+
+
+class TestControllerDataIntegrity:
+    """
+    TC-RT-6.14: Save populates timestamps automatically
+    ------------------------------------------------------
+    Purpose:  Verify that created_at and updated_at are automatically set
+              by the database on save and returned in the API response.
+    Setup:    POST /reports with valid data.
+    Action:   Check response for created_at and updated_at.
+    Expect:   Both are non-null ISO datetime strings.
+    """
+
+    def test_save_populates_timestamps(self, client, controller_token):
+        r = client.post(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "group_key": "5104",
+                "cost_center": "5104",
+                "location_labels": "Timestamp Test",
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.25,
+                "preparer": "Chris Controller",
+                "status": "Reasonable",
+                "location_reports": [SAMPLE_LOC_REPORT],
+            },
+        )
+        assert r.status_code == 201
+        body = r.json()
+        assert body["created_at"] is not None, "created_at should be auto-populated"
+        assert body["updated_at"] is not None, "updated_at should be auto-populated"
+        assert "T" in body["created_at"], "Should be ISO datetime format"
+
+    """
+    TC-RT-6.15: Special characters in conclusion round-trip through JSON
+    ----------------------------------------------------------------------
+    Purpose:  Verify that conclusions containing special characters
+              (quotes, newlines, Unicode) are correctly stored and
+              retrieved from the JSON column without corruption.
+    Setup:    Save a report where conclusion contains special chars.
+    Action:   POST /reports, then GET /reports/{id}.
+    Expect:   Conclusion text matches exactly, including all special chars.
+    """
+
+    def test_save_special_characters(self, client, controller_token):
+        special_conclusion = 'Funds are "reasonable" & stable.\nNo action needed — all good! €£¥'
+        lr = {
+            **SAMPLE_LOC_REPORT,
+            "conclusion": special_conclusion,
+        }
+        r = client.post(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "group_key": "5082",
+                "cost_center": "5082",
+                "location_labels": "Special Chars Test",
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+                "preparer": "Chris Controller",
+                "status": "Reasonable",
+                "location_reports": [lr],
+            },
+        )
+        assert r.status_code == 201
+
+        detail = client.get(
+            f"/v1/reasonableness/reports/{r.json()['id']}",
+            headers={"Authorization": f"Bearer {controller_token}"},
+        )
+        stored = detail.json()["location_reports"][0]["conclusion"]
+        assert stored == special_conclusion, f"Expected special chars preserved, got: {stored}"
