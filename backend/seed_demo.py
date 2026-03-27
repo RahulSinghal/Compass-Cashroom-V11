@@ -205,6 +205,19 @@ def seed():
                          location_ids=[o["loc"]], active=True)
                 db.add(u)
                 print(f"  + created {o['email']}")
+
+        # Ensure default operator@compass.com has loc-1 assigned
+        default_op = db.query(User).filter_by(email="operator@compass.com").first()
+        if default_op and not default_op.location_ids:
+            default_op.location_ids = ["loc-1"]
+            print("  + assigned loc-1 to operator@compass.com")
+
+        # Ensure default controller@compass.com has locations assigned
+        default_ctrl = db.query(User).filter_by(email="controller@compass.com").first()
+        if default_ctrl and not default_ctrl.location_ids:
+            default_ctrl.location_ids = ["loc-1", "loc-2", "loc-3"]
+            print("  + assigned loc-1,2,3 to controller@compass.com")
+
         db.commit()
 
         # ── 4. Build operator→location index ─────────────────────────────────

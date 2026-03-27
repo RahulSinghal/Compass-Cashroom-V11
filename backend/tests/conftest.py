@@ -28,12 +28,13 @@ TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engin
 DEMO_PASSWORD = "demo1234"
 
 SEED_USERS = [
-    {"email": "operator@compass.com",   "name": "Alex Operator",   "role": UserRole.OPERATOR,            "location_ids": ["loc-1"]},
-    {"email": "controller@compass.com", "name": "Chris Controller", "role": UserRole.CONTROLLER,          "location_ids": ["loc-1", "loc-2", "loc-3"]},
-    {"email": "dgm@compass.com",        "name": "Diana DGM",        "role": UserRole.DGM,                 "location_ids": []},
-    {"email": "admin@compass.com",      "name": "Adam Admin",       "role": UserRole.ADMIN,               "location_ids": []},
-    {"email": "auditor@compass.com",    "name": "Audrey Auditor",   "role": UserRole.AUDITOR,             "location_ids": []},
-    {"email": "rc@compass.com",         "name": "Rachel RC",        "role": UserRole.REGIONAL_CONTROLLER, "location_ids": []},
+    {"email": "operator@compass.com",    "name": "Alex Operator",    "role": UserRole.OPERATOR,            "location_ids": ["loc-1"]},
+    {"email": "controller@compass.com",  "name": "Chris Controller", "role": UserRole.CONTROLLER,          "location_ids": ["loc-1", "loc-2", "loc-3"]},
+    {"email": "controller2@compass.com", "name": "Pat Controller2",  "role": UserRole.CONTROLLER,          "location_ids": ["loc-4", "loc-5"]},
+    {"email": "dgm@compass.com",         "name": "Diana DGM",        "role": UserRole.DGM,                 "location_ids": []},
+    {"email": "admin@compass.com",       "name": "Adam Admin",       "role": UserRole.ADMIN,               "location_ids": []},
+    {"email": "auditor@compass.com",     "name": "Audrey Auditor",   "role": UserRole.AUDITOR,             "location_ids": []},
+    {"email": "rc@compass.com",          "name": "Rachel RC",        "role": UserRole.REGIONAL_CONTROLLER, "location_ids": []},
 ]
 
 SEED_LOCATIONS = [
@@ -109,6 +110,27 @@ def operator_token(client):
 @pytest.fixture(scope="session")
 def controller_token(client):
     r = client.post("/v1/auth/login", json={"email": "controller@compass.com", "password": DEMO_PASSWORD})
+    assert r.status_code == 200
+    return r.json()["access_token"]
+
+
+@pytest.fixture(scope="session")
+def controller2_token(client):
+    r = client.post("/v1/auth/login", json={"email": "controller2@compass.com", "password": DEMO_PASSWORD})
+    assert r.status_code == 200
+    return r.json()["access_token"]
+
+
+@pytest.fixture(scope="session")
+def dgm_token(client):
+    r = client.post("/v1/auth/login", json={"email": "dgm@compass.com", "password": DEMO_PASSWORD})
+    assert r.status_code == 200
+    return r.json()["access_token"]
+
+
+@pytest.fixture(scope="session")
+def rc_token(client):
+    r = client.post("/v1/auth/login", json={"email": "rc@compass.com", "password": DEMO_PASSWORD})
     assert r.status_code == 200
     return r.json()["access_token"]
 

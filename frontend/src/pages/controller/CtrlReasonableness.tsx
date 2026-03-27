@@ -63,7 +63,15 @@ export default function CtrlReasonableness({ controllerName }: Props) {
   // ── Step 1: Parameter selection ────────────────────────────────────────
   const [selectedGroup, setSelectedGroup] = useState('')
   const [fromDate, setFromDate] = useState('')
-  const [toDate, setToDate] = useState(todayStr())
+  const [toDate, setToDate] = useState(() => {
+    // Default to last day of previous completed month
+    const now = new Date()
+    const lastDay = new Date(now.getFullYear(), now.getMonth(), 0)
+    const y = lastDay.getFullYear()
+    const m = String(lastDay.getMonth() + 1).padStart(2, '0')
+    const d = String(lastDay.getDate()).padStart(2, '0')
+    return `${y}-${m}-${d}`
+  })
   const [factor, setFactor] = useState('')
   const [preparer, setPreparer] = useState(controllerName)
   const [scope, setScope] = useState('')
@@ -79,6 +87,18 @@ export default function CtrlReasonableness({ controllerName }: Props) {
   const [saved, setSaved] = useState(false)
 
   const today = todayStr()
+
+  // RT-004: Date picker must block current and future months.
+  // Latest selectable date = last day of the most recently completed month.
+  const maxSelectableDate = useMemo(() => {
+    const now = new Date()
+    // First day of current month, then go back 1 day = last day of previous month
+    const lastDayPrevMonth = new Date(now.getFullYear(), now.getMonth(), 0)
+    const y = lastDayPrevMonth.getFullYear()
+    const m = String(lastDayPrevMonth.getMonth() + 1).padStart(2, '0')
+    const d = String(lastDayPrevMonth.getDate()).padStart(2, '0')
+    return `${y}-${m}-${d}`
+  }, [])
 
   // ── Derived: selected group config ─────────────────────────────────────
   const groupConfig: LocationGroup | undefined = useMemo(
@@ -529,14 +549,14 @@ table{border-collapse:collapse}td,th{border:1px solid #999;padding:3px 8px;font-
                 <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: 'var(--tm)', marginBottom: 5, letterSpacing: '.04em', textTransform: 'uppercase' }}>
                   Date Range From <span style={{ color: 'var(--red)' }}>*</span>
                 </label>
-                <input type="date" value={fromDate} max={today} onChange={e => setFromDate(e.target.value)}
+                <input type="date" value={fromDate} max={maxSelectableDate} onChange={e => setFromDate(e.target.value)}
                   style={{ width: '100%', padding: '9px 12px', borderRadius: 7, border: '1.5px solid var(--border)', fontSize: 13.5, background: 'var(--bg-muted)', boxSizing: 'border-box' }} />
               </div>
               <div>
                 <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: 'var(--tm)', marginBottom: 5, letterSpacing: '.04em', textTransform: 'uppercase' }}>
                   Date Range To <span style={{ color: 'var(--red)' }}>*</span>
                 </label>
-                <input type="date" value={toDate} max={today} onChange={e => setToDate(e.target.value)}
+                <input type="date" value={toDate} max={maxSelectableDate} onChange={e => setToDate(e.target.value)}
                   style={{ width: '100%', padding: '9px 12px', borderRadius: 7, border: '1.5px solid var(--border)', fontSize: 13.5, background: 'var(--bg-muted)', boxSizing: 'border-box' }} />
               </div>
             </div>

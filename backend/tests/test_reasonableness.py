@@ -1940,3 +1940,300 @@ class TestControllerDataIntegrity:
         )
         stored = detail.json()["location_reports"][0]["conclusion"]
         assert stored == special_conclusion, f"Expected special chars preserved, got: {stored}"
+
+
+# ===========================================================================
+# PHASE 7 — RT-009 & RT-013 Gap Tests (Second Controller + DGM/RC)
+# ===========================================================================
+# These tests fill coverage gaps identified by comparing against
+# Controller_ReasonablenessTest_TestCases.md (RT-009, RT-013).
+
+
+class TestSecondControllerIsolation:
+    """
+    TC-RT-7.1: Second controller sees only their assigned locations
+    ----------------------------------------------------------------
+    Purpose:  Verify that a second controller with different location
+              assignments sees only their own locations in location-groups,
+              completely isolated from the first controller's locations.
+    Setup:    Controller1 (controller@compass.com) assigned to loc-1, loc-2, loc-3
+              (cost centers 5082, 5104).
+              Controller2 (controller2@compass.com) assigned to loc-4, loc-5
+              (cost centers 5117, 5132).
+    Action:   Both controllers call GET /location-groups.
+    Expect:   Controller1 sees 5082, 5104 only.
+              Controller2 sees 5117, 5132 only.
+              No overlap between them.
+    """
+
+    def test_controllers_see_only_their_locations(self, client, controller_token, controller2_token):
+        # Controller 1
+        r1 = client.get(
+            "/v1/reasonableness/location-groups",
+            headers={"Authorization": f"Bearer {controller_token}"},
+        )
+        assert r1.status_code == 200
+        cc1 = {g["cost_center"] for g in r1.json()}
+        assert "5082" in cc1, "Controller1 should see 5082"
+        assert "5104" in cc1, "Controller1 should see 5104"
+        assert "5117" not in cc1, "Controller1 should NOT see 5117"
+        assert "5132" not in cc1, "Controller1 should NOT see 5132"
+
+        # Controller 2
+        r2 = client.get(
+            "/v1/reasonableness/location-groups",
+            headers={"Authorization": f"Bearer {controller2_token}"},
+        )
+        assert r2.status_code == 200
+        cc2 = {g["cost_center"] for g in r2.json()}
+        assert "5117" in cc2, "Controller2 should see 5117"
+        assert "5132" in cc2, "Controller2 should see 5132"
+        assert "5082" not in cc2, "Controller2 should NOT see 5082"
+        assert "5104" not in cc2, "Controller2 should NOT see 5104"
+
+        # No overlap
+        assert cc1.isdisjoint(cc2), "Controllers' location groups should not overlap"
+
+    """
+    TC-RT-7.2: Controller2 can generate for their locations only
+    --------------------------------------------------------------
+    Purpose:  Verify Controller2 can generate reports for loc-4/loc-5
+              but cannot access Controller1's locations.
+    Setup:    Controller2 assigned to loc-4, loc-5.
+    Action:   1. Controller2 generates for loc-4 (their location) → success.
+              2. Controller2 generates for loc-1 (not theirs) → still succeeds
+                 at API level (no per-location authz check in generate), but
+                 location-groups won't show it.
+    Expect:   Generate for own location returns 200.
+    """
+
+    def test_controller2_generates_for_own_location(self, client, controller2_token):
+        r = client.post(
+            "/v1/reasonableness/generate",
+            headers={"Authorization": f"Bearer {controller2_token}"},
+            json={
+                "location_ids": ["loc-4"],
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.25,
+            },
+        )
+        assert r.status_code == 200
+        assert len(r.json()["calculations"]) == 1
+        assert r.json()["calculations"][0]["loc_id"] == "loc-4"
+
+    """
+    TC-RT-7.3: Controller2 can save and list their own reports
+    ------------------------------------------------------------
+    Purpose:  Verify Controller2 can save reports and see them in the list.
+    Setup:    Controller2 saves a report for their locations.
+    Action:   POST /reports, then GET /reports.
+    Expect:   Report saved successfully, appears in list.
+    """
+
+    def test_controller2_saves_and_lists(self, client, controller2_token):
+        # Save
+        save_r = client.post(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {controller2_token}"},
+            json={
+                "group_key": "5117",
+                "cost_center": "5117",
+                "location_labels": "Heathrow T2 Outlet",
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.25,
+                "preparer": "Pat Controller2",
+                "status": "Reasonable",
+                "location_reports": [SAMPLE_LOC_REPORT],
+            },
+        )
+        assert save_r.status_code == 201
+        assert save_r.json()["preparer"] == "Pat Controller2"
+
+        # List — should see their report
+        list_r = client.get(
+            "/v1/reasonableness/reports?page_size=100",
+            headers={"Authorization": f"Bearer {controller2_token}"},
+        )
+        assert list_r.status_code == 200
+        labels = [item["location_labels"] for item in list_r.json()["items"]]
+        assert "Heathrow T2 Outlet" in labels
+
+
+class TestDgmRcPermissions:
+    """
+    TC-RT-7.4: DGM cannot access location groups
+    -----------------------------------------------
+    Purpose:  Verify DGM role is blocked from reasonableness location groups.
+    Setup:    Use DGM token.
+    Action:   GET /location-groups.
+    Expect:   403 Forbidden.
+    """
+
+    def test_dgm_cannot_get_location_groups(self, client, dgm_token):
+        r = client.get(
+            "/v1/reasonableness/location-groups",
+            headers={"Authorization": f"Bearer {dgm_token}"},
+        )
+        assert r.status_code == 403
+
+    """
+    TC-RT-7.5: DGM cannot generate reports
+    -----------------------------------------
+    Purpose:  Verify DGM role is blocked from generating.
+    Setup:    Use DGM token.
+    Action:   POST /generate.
+    Expect:   403 Forbidden.
+    """
+
+    def test_dgm_cannot_generate(self, client, dgm_token):
+        r = client.post(
+            "/v1/reasonableness/generate",
+            headers={"Authorization": f"Bearer {dgm_token}"},
+            json={
+                "location_ids": ["loc-1"],
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+            },
+        )
+        assert r.status_code == 403
+
+    """
+    TC-RT-7.6: DGM cannot save reports
+    -------------------------------------
+    Purpose:  Verify DGM role is blocked from saving.
+    Setup:    Use DGM token.
+    Action:   POST /reports.
+    Expect:   403 Forbidden.
+    """
+
+    def test_dgm_cannot_save(self, client, dgm_token):
+        r = client.post(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {dgm_token}"},
+            json={
+                "group_key": "5082",
+                "cost_center": "5082",
+                "location_labels": "DGM Test",
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+                "preparer": "Diana DGM",
+                "status": "Reasonable",
+                "location_reports": [],
+            },
+        )
+        assert r.status_code == 403
+
+    """
+    TC-RT-7.7: DGM cannot list reports
+    -------------------------------------
+    Purpose:  Verify DGM role is blocked from listing reports.
+    Setup:    Use DGM token.
+    Action:   GET /reports.
+    Expect:   403 Forbidden.
+    """
+
+    def test_dgm_cannot_list(self, client, dgm_token):
+        r = client.get(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {dgm_token}"},
+        )
+        assert r.status_code == 403
+
+    """
+    TC-RT-7.8: DGM cannot view report detail
+    -------------------------------------------
+    Purpose:  Verify DGM role is blocked from viewing report detail.
+    Setup:    Use DGM token with a known report ID.
+    Action:   GET /reports/{id}.
+    Expect:   403 Forbidden.
+    """
+
+    def test_dgm_cannot_view_detail(self, client, dgm_token, controller_token):
+        # Get a valid report ID
+        list_r = client.get(
+            "/v1/reasonableness/reports?page_size=1",
+            headers={"Authorization": f"Bearer {controller_token}"},
+        )
+        report_id = list_r.json()["items"][0]["id"]
+
+        r = client.get(
+            f"/v1/reasonableness/reports/{report_id}",
+            headers={"Authorization": f"Bearer {dgm_token}"},
+        )
+        assert r.status_code == 403
+
+    """
+    TC-RT-7.9: Regional Controller CAN list and view reports (by design)
+    ----------------------------------------------------------------------
+    Purpose:  Verify RC role has READ access to reports (list + detail)
+              but CANNOT generate or save (those are Controller-only).
+    Setup:    Use RC token.
+    Action:   1. GET /location-groups → 200 (RC can view groups)
+              2. GET /reports → 200 (RC can list)
+              3. GET /reports/{id} → 200 (RC can view detail)
+              4. POST /generate → 403 (RC cannot generate)
+              5. POST /reports → 403 (RC cannot save)
+    Expect:   Read access granted, write access denied.
+    """
+
+    def test_rc_can_read_but_not_write(self, client, rc_token, controller_token):
+        # RC CAN view location groups
+        r = client.get(
+            "/v1/reasonableness/location-groups",
+            headers={"Authorization": f"Bearer {rc_token}"},
+        )
+        assert r.status_code == 200
+
+        # RC CAN list reports
+        r = client.get(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {rc_token}"},
+        )
+        assert r.status_code == 200
+
+        # RC CAN view report detail
+        list_r = client.get(
+            "/v1/reasonableness/reports?page_size=1",
+            headers={"Authorization": f"Bearer {controller_token}"},
+        )
+        report_id = list_r.json()["items"][0]["id"]
+        r = client.get(
+            f"/v1/reasonableness/reports/{report_id}",
+            headers={"Authorization": f"Bearer {rc_token}"},
+        )
+        assert r.status_code == 200
+
+        # RC CANNOT generate
+        r = client.post(
+            "/v1/reasonableness/generate",
+            headers={"Authorization": f"Bearer {rc_token}"},
+            json={
+                "location_ids": ["loc-1"],
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+            },
+        )
+        assert r.status_code == 403
+
+        # RC CANNOT save
+        r = client.post(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {rc_token}"},
+            json={
+                "group_key": "5082",
+                "cost_center": "5082",
+                "location_labels": "RC Test",
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+                "preparer": "Rachel RC",
+                "status": "Reasonable",
+                "location_reports": [],
+            },
+        )
+        assert r.status_code == 403
