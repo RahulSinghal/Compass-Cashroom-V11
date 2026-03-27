@@ -11,15 +11,13 @@ For AI engineers, developers, and architects working on the CashRoom Compliance 
 | `gap-analysis/` | Prototype vs codebase fit, technical gaps, screen modification maps | Dev Lead |
 | `implementation-plans/` | Feature-level TDD plans, implementation strategies with test cases | Dev Lead, AI Engineer |
 | `developer-guide/` | Onboarding, handover docs, test case reference | Dev Lead |
-| `ai-instructions/` | Claude Code / AI assistant context files | Dev Lead |
-
 ## Quick Links
 
+- **AI Context**: `CLAUDE.md` — full technical context for Claude Code
 - **Architecture**: `architecture/ARCHITECTURE.md` — system diagram, roles, submission lifecycle
 - **API Reference**: `architecture/API_DOC.md` — complete endpoint reference
 - **DB Schema**: `architecture/DB_DESIGN.md` — ERD and table details
 - **Getting Started**: `developer-guide/DEVELOPER_HANDOVER.md` — screen-by-screen guide
-- **AI Context**: `ai-instructions/CLAUDE.md` — coding patterns and conventions
 
 ## Tech Stack
 
