@@ -1072,3 +1072,299 @@ class TestListAndDetailReports:
             headers={"Authorization": f"Bearer {controller_token}"},
         )
         assert r.status_code == 404
+
+
+# ===========================================================================
+# PHASE 5 — Admin Integration Tests (TC-RT-5.x)
+# ===========================================================================
+# These tests verify the end-to-end flow between Controller and Admin:
+# Controller saves reports → Admin can see, filter, paginate, and view
+# detail of ALL reports. Also verifies permission boundaries (Operator
+# is blocked from all read endpoints).
+
+
+class TestAdminIntegration:
+    """
+    TC-RT-5.1: Controller saves report, Admin sees it in list
+    -----------------------------------------------------------
+    Purpose:  Verify the core integration: when a controller saves a
+              reasonableness report, the admin can see it via the list endpoint.
+    Setup:    1. Controller saves a report with unique location_labels "Integration Test Alpha".
+              2. Admin calls GET /reports to list all reports.
+    Action:   Compare the saved report's ID against the admin's list.
+    Expect:   The report saved by controller appears in admin's list.
+              Admin sees the same id, status, preparer, and location_labels.
+    """
+
+    def test_controller_saves_admin_sees(self, client, controller_token, admin_token):
+        # Step 1: Controller saves a report
+        save_r = client.post(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "group_key": "5082",
+                "cost_center": "5082",
+                "location_labels": "Integration Test Alpha",
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+                "preparer": "Chris Controller",
+                "scope": "Integration test",
+                "status": "Reasonable",
+                "location_reports": [SAMPLE_LOC_REPORT],
+            },
+        )
+        assert save_r.status_code == 201
+        saved_id = save_r.json()["id"]
+
+        # Step 2: Admin lists all reports
+        list_r = client.get(
+            "/v1/reasonableness/reports?page_size=100",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert list_r.status_code == 200
+        data = list_r.json()
+
+        # Step 3: Verify the saved report appears in admin's list
+        found = [item for item in data["items"] if item["id"] == saved_id]
+        assert len(found) == 1, f"Admin should see report {saved_id} in list"
+        assert found[0]["location_labels"] == "Integration Test Alpha"
+        assert found[0]["status"] == "Reasonable"
+        assert found[0]["preparer"] == "Chris Controller"
+
+    """
+    TC-RT-5.2: Admin sees ALL controllers' reports (oversight role)
+    ----------------------------------------------------------------
+    Purpose:  Verify that admin has full oversight — they see reports
+              from ALL controllers, not filtered to any specific user.
+    Setup:    1. Controller saves 2 reports with distinct labels.
+              2. Admin lists all reports.
+    Action:   Check that both reports appear in admin's list.
+    Expect:   Admin's total count includes both reports.
+              Both distinct labels are present in the items.
+    """
+
+    def test_admin_sees_all_reports(self, client, controller_token, admin_token):
+        # Step 1: Controller saves two reports with distinct labels
+        for label, status in [("Oversight Test A", "Reasonable"), ("Oversight Test B", "Overfunded")]:
+            r = client.post(
+                "/v1/reasonableness/reports",
+                headers={"Authorization": f"Bearer {controller_token}"},
+                json={
+                    "group_key": "5082",
+                    "cost_center": "5082",
+                    "location_labels": label,
+                    "from_date": "2026-01-15",
+                    "to_date": "2026-01-21",
+                    "factor": 1.50,
+                    "preparer": "Chris Controller",
+                    "status": status,
+                    "location_reports": [SAMPLE_LOC_REPORT],
+                },
+            )
+            assert r.status_code == 201
+
+        # Step 2: Admin lists all reports
+        list_r = client.get(
+            "/v1/reasonableness/reports?page_size=100",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert list_r.status_code == 200
+        labels = [item["location_labels"] for item in list_r.json()["items"]]
+
+        # Step 3: Both reports visible to admin
+        assert "Oversight Test A" in labels, "Admin should see Oversight Test A"
+        assert "Oversight Test B" in labels, "Admin should see Oversight Test B"
+
+    """
+    TC-RT-5.3: Admin can view full report detail by ID
+    -----------------------------------------------------
+    Purpose:  Verify that admin can retrieve a specific report's full detail
+              including nested location_reports JSON with all calculation fields.
+    Setup:    1. Controller saves a report with 2 location reports
+              (one Reasonable, one Overfunded).
+              2. Admin calls GET /reports/{id}.
+    Action:   Check all fields in the response.
+    Expect:   200 OK. Response includes id, location_labels, status,
+              and location_reports array with 2 entries containing
+              loc_id, total, expected_fund, actual_fund, conclusion, etc.
+    """
+
+    def test_admin_gets_report_detail(self, client, controller_token, admin_token):
+        # Step 1: Controller saves report with 2 sub-location reports
+        save_r = client.post(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {controller_token}"},
+            json={
+                "group_key": "5082",
+                "cost_center": "5082",
+                "location_labels": "Detail Test Admin",
+                "from_date": "2026-01-15",
+                "to_date": "2026-01-21",
+                "factor": 1.50,
+                "preparer": "Chris Controller",
+                "scope": "Q2 FY2026",
+                "status": "Overfunded",
+                "location_reports": [SAMPLE_LOC_REPORT, SAMPLE_LOC_REPORT_OVERFUNDED],
+            },
+        )
+        assert save_r.status_code == 201
+        report_id = save_r.json()["id"]
+
+        # Step 2: Admin retrieves the detail
+        detail_r = client.get(
+            f"/v1/reasonableness/reports/{report_id}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert detail_r.status_code == 200
+        body = detail_r.json()
+
+        # Step 3: Verify all fields
+        assert body["id"] == report_id
+        assert body["location_labels"] == "Detail Test Admin"
+        assert body["status"] == "Overfunded"
+        assert body["cost_center"] == "5082"
+        assert body["factor"] == 1.50
+        assert body["preparer"] == "Chris Controller"
+        assert body["scope"] == "Q2 FY2026"
+
+        # Verify nested location_reports
+        assert len(body["location_reports"]) == 2
+        lr1 = body["location_reports"][0]
+        assert lr1["loc_id"] == "loc-1"
+        assert lr1["total"] == 3452.0
+        assert lr1["status"] == "Reasonable"
+        assert lr1["conclusion"] == "Funds within acceptable range for Q2 operations."
+
+        lr2 = body["location_reports"][1]
+        assert lr2["loc_id"] == "loc-2"
+        assert lr2["status"] == "Overfunded"
+        assert lr2["required_actions"] == "yes"
+
+    """
+    TC-RT-5.4: Admin can filter reports by status
+    ------------------------------------------------
+    Purpose:  Verify that admin's status filter returns only matching reports.
+    Setup:    Previous tests have saved both Reasonable and Overfunded reports.
+    Action:   1. Admin filters by ?status=Overfunded
+              2. Admin filters by ?status=Reasonable
+    Expect:   Each filtered result contains only reports with matching status.
+              No cross-contamination between statuses.
+    """
+
+    def test_admin_filter_by_status(self, client, admin_token):
+        # Filter: Overfunded only
+        r_over = client.get(
+            "/v1/reasonableness/reports?status=Overfunded&page_size=100",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_over.status_code == 200
+        for item in r_over.json()["items"]:
+            assert item["status"] == "Overfunded", \
+                f"Expected Overfunded, got {item['status']} for report {item['id']}"
+
+        # Filter: Reasonable only
+        r_reas = client.get(
+            "/v1/reasonableness/reports?status=Reasonable&page_size=100",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_reas.status_code == 200
+        for item in r_reas.json()["items"]:
+            assert item["status"] == "Reasonable", \
+                f"Expected Reasonable, got {item['status']} for report {item['id']}"
+
+        # Sanity: filtered counts should sum to total
+        r_all = client.get(
+            "/v1/reasonableness/reports?page_size=100",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        total = r_all.json()["total"]
+        assert r_over.json()["total"] + r_reas.json()["total"] == total, \
+            "Filtered counts should sum to unfiltered total"
+
+    """
+    TC-RT-5.5: Admin pagination returns correct metadata
+    ------------------------------------------------------
+    Purpose:  Verify server-side pagination works correctly for admin,
+              including total, page, page_size, total_pages, and items count.
+    Setup:    Previous tests have saved multiple reports (at least 3).
+    Action:   Admin requests page_size=2, then checks page 1 and page 2.
+    Expect:   Page 1: items <= 2, page=1, page_size=2, total >= 3.
+              Page 2: items <= 2, page=2.
+              total_pages = ceil(total / 2).
+    """
+
+    def test_admin_pagination(self, client, admin_token):
+        # Page 1
+        r1 = client.get(
+            "/v1/reasonableness/reports?page=1&page_size=2",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r1.status_code == 200
+        d1 = r1.json()
+        assert len(d1["items"]) <= 2
+        assert d1["page"] == 1
+        assert d1["page_size"] == 2
+        assert d1["total"] >= 3, "Should have at least 3 reports from previous tests"
+
+        import math
+        expected_pages = math.ceil(d1["total"] / 2)
+        assert d1["total_pages"] == expected_pages
+
+        # Page 2
+        r2 = client.get(
+            "/v1/reasonableness/reports?page=2&page_size=2",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r2.status_code == 200
+        d2 = r2.json()
+        assert len(d2["items"]) <= 2
+        assert d2["page"] == 2
+
+        # Items on page 1 and page 2 should be different
+        ids_p1 = {item["id"] for item in d1["items"]}
+        ids_p2 = {item["id"] for item in d2["items"]}
+        assert ids_p1.isdisjoint(ids_p2), "Pages should have distinct reports"
+
+    """
+    TC-RT-5.6: Operator cannot list reports
+    ------------------------------------------
+    Purpose:  Verify that operators are blocked from the reports list endpoint.
+              Operators provide source data (daily submissions) but have no
+              business need to see compliance reports.
+    Setup:    Use operator token.
+    Action:   GET /reports with operator token.
+    Expect:   403 Forbidden.
+    """
+
+    def test_operator_cannot_list_reports(self, client, operator_token):
+        r = client.get(
+            "/v1/reasonableness/reports",
+            headers={"Authorization": f"Bearer {operator_token}"},
+        )
+        assert r.status_code == 403
+
+    """
+    TC-RT-5.7: Operator cannot view report detail
+    ------------------------------------------------
+    Purpose:  Verify that operators are blocked from viewing individual
+              report details, even if they know the report ID.
+    Setup:    Use operator token with a known report ID (from previous tests).
+    Action:   GET /reports/{id} with operator token.
+    Expect:   403 Forbidden.
+    """
+
+    def test_operator_cannot_view_detail(self, client, controller_token, operator_token):
+        # First, get a valid report ID via controller
+        list_r = client.get(
+            "/v1/reasonableness/reports?page_size=1",
+            headers={"Authorization": f"Bearer {controller_token}"},
+        )
+        report_id = list_r.json()["items"][0]["id"]
+
+        # Operator tries to view it
+        r = client.get(
+            f"/v1/reasonableness/reports/{report_id}",
+            headers={"Authorization": f"Bearer {operator_token}"},
+        )
+        assert r.status_code == 403
